@@ -33,4 +33,4 @@ jobs:
       - run: |
           cp src/index.ts src/index.test.ts portal/packages/koamishin-auth-js/src/
           cd portal
-          ./node_modules/.bin/vitest run packages/koamishin-auth-js/src/index.test.ts
+          ./node_modules/.bin/vitest run --config ../vitest.config.mjs packages/koamishin-auth-js/src/index.test.ts

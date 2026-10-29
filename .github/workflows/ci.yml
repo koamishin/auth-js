@@ -15,4 +15,22 @@ jobs:
         with:
           node-version: 20
       - run: npm install -g typescript
-      - run: tsc --noEmit src/index.ts
+      - run: tsc --noEmit --target ES2020 --module ESNext --moduleResolution bundler --lib ES2020,DOM src/index.ts
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: koamishin/koamishin-portal
+          path: portal
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: portal
+      - run: |
+          cp src/index.ts src/index.test.ts portal/packages/koamishin-auth-js/src/
+          cd portal
+          ./node_modules/.bin/vitest run packages/koamishin-auth-js/src/index.test.ts

@@ -472,10 +472,13 @@ test('rejects userinfo responses whose environment mismatches the configured pub
     );
 
     for (const response of [null, {}, { environment: 7 }, []]) {
-        vi.stubGlobal('fetch', vi.fn(async () => ({
-            ok: true,
-            json: async () => response,
-        })));
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => ({
+                ok: true,
+                json: async () => response,
+            })),
+        );
         await expect(devClient.getUser('token')).rejects.toThrow(
             'Userinfo environment does not match the configured publishable key.',
         );

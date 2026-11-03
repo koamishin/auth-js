@@ -1,11 +1,13 @@
 import { generatePkce, generateState } from './pkce';
 
-export interface KoamishinConfig {
+export type KoamishinConfig = {
     portalUrl: string;
-    clientId: string;
     redirectUri: string;
     scopes?: string[];
-}
+} & (
+    | { publishableKey: string; clientId?: string }
+    | { clientId: string; publishableKey?: string }
+);
 
 export interface KoamishinUser {
     sub: string;
@@ -16,6 +18,10 @@ export interface KoamishinUser {
     roles: string[];
     permissions: string[];
     updated_at?: number;
+    organization_id?: string;
+    application_id?: string;
+    environment?: 'development' | 'production' | string;
+    public_metadata?: Record<string, unknown>;
 }
 
 export interface TokenResponse {
@@ -34,14 +40,56 @@ interface AuthenticationTransaction {
 export class KoamishinClient {
     protected portalUrl: string;
     protected clientId: string;
+    protected publishableKey?: string;
     protected redirectUri: string;
     protected scopes: string[];
 
     constructor(config: KoamishinConfig) {
+        const publishableKey = config.publishableKey?.trim();
+        const clientId = config.clientId?.trim();
+
+        if (publishableKey && clientId && publishableKey !== clientId) {
+            throw new Error(
+                'Provide either publishableKey or clientId, or ensure both match.',
+            );
+        }
+
+        const identifier = publishableKey || clientId || '';
+
+        if (!identifier) {
+            throw new Error(
+                'A Koamishin publishableKey or clientId is required.',
+            );
+        }
+
+        if (identifier.startsWith('sk_')) {
+            throw new Error(
+                'Secret keys (sk_...) must never be used in browser code. Use a publishableKey (pk_test_... or pk_live_...) instead.',
+            );
+        }
+
         this.portalUrl = config.portalUrl.replace(/\/+$/, '');
-        this.clientId = config.clientId;
+        this.clientId = identifier;
+        this.publishableKey = identifier.startsWith('pk_')
+            ? identifier
+            : undefined;
         this.redirectUri = config.redirectUri;
         this.scopes = config.scopes ?? ['openid', 'profile', 'email', 'roles'];
+    }
+
+    /**
+     * Return the target Portal environment inferred from a publishable key, or null for legacy client IDs.
+     */
+    getEnvironment(): 'development' | 'production' | null {
+        if (this.clientId.startsWith('pk_test_')) {
+            return 'development';
+        }
+
+        if (this.clientId.startsWith('pk_live_')) {
+            return 'production';
+        }
+
+        return null;
     }
 
     /**
@@ -136,6 +184,7 @@ export class KoamishinClient {
         }
 
         const tokens: TokenResponse = await tokenResponse.json();
+        const user = await this.getUser(tokens.access_token);
 
         sessionStorage.setItem(
             this.storageKey('access_token'),
@@ -147,8 +196,6 @@ export class KoamishinClient {
                 tokens.refresh_token,
             );
         }
-
-        const user = await this.getUser(tokens.access_token);
 
         return { user, tokens };
     }
@@ -217,7 +264,22 @@ export class KoamishinClient {
             throw new Error('Failed to retrieve user claims.');
         }
 
-        return response.json();
+        const user: KoamishinUser = await response.json();
+        const expectedEnvironment = this.getEnvironment();
+
+        if (
+            expectedEnvironment !== null &&
+            (!user ||
+                typeof user !== 'object' ||
+                Array.isArray(user) ||
+                user.environment !== expectedEnvironment)
+        ) {
+            throw new Error(
+                'Userinfo environment does not match the configured publishable key.',
+            );
+        }
+
+        return user;
     }
 
     /**

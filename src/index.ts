@@ -32,6 +32,37 @@ export interface TokenResponse {
     id_token?: string;
 }
 
+/** The mint response for a short-lived session token. */
+export interface SessionToken {
+    token: string;
+    token_type: string;
+    expires_in: number;
+    expires_at: number;
+}
+
+/**
+ * The claims carried by a session token, following Koamishin Auth's session
+ * token version 2.
+ */
+export interface SessionTokenClaims {
+    sub: string;
+    iss: string;
+    iat: number;
+    nbf: number;
+    exp: number;
+    jti: string;
+    sid: string;
+    azp?: string;
+    v: string;
+    fva: [number, number];
+    sts: 'active' | 'pending';
+    tasks: string[];
+    application_id?: string;
+    environment?: string;
+    o?: { id: string; slg: string; rol: string };
+    act?: { iss: string; sid: string; sub: string };
+}
+
 interface AuthenticationTransaction {
     verifier: string;
     createdAt: number;
@@ -244,6 +275,40 @@ export class KoamishinClient {
     }
 
     /**
+     * Mint a short-lived session token for the current session.
+     *
+     * Session tokens are sixty-second JWTs that application backends verify
+     * offline against the JWKS document, instead of calling the userinfo
+     * endpoint on every request. The claims are only trustworthy once a
+     * backend has verified the signature.
+     */
+    async getSessionToken(token?: string): Promise<SessionToken> {
+        const accessToken =
+            token ?? sessionStorage.getItem(this.storageKey('access_token'));
+
+        if (!accessToken) {
+            throw new Error('No access token available.');
+        }
+
+        const response = await fetch(
+            `${this.portalUrl}/api/oauth/session-token`,
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                },
+            },
+        );
+
+        if (!response.ok) {
+            const err = await response.text();
+            throw new Error(`Session token mint failed: ${err}`);
+        }
+
+        return (await response.json()) as SessionToken;
+    }
+
+    /**
      * Fetch user identity claims from Portal userinfo endpoint.
      */
     async getUser(token?: string): Promise<KoamishinUser> {
@@ -334,6 +399,46 @@ export class KoamishinClient {
             }),
         ) as Record<string, AuthenticationTransaction>;
     }
+}
+
+/**
+ * Decode a session token's claims WITHOUT verifying the signature.
+ *
+ * Browser code cannot be trusted with verification anyway, so use this for
+ * display and routing only. A backend must verify the token against the
+ * Koamishin Auth JWKS document before trusting any claim on it.
+ */
+export function decodeSessionToken(
+    sessionToken: string | SessionToken,
+): SessionTokenClaims {
+    const jwt =
+        typeof sessionToken === 'string' ? sessionToken : sessionToken.token;
+    const parts = jwt.split('.');
+    if (parts.length !== 3) {
+        throw new Error('The session token is not a JWT.');
+    }
+
+    const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = payload + '='.repeat((4 - (payload.length % 4)) % 4);
+
+    let claims: unknown;
+    try {
+        claims = JSON.parse(atob(padded));
+    } catch {
+        throw new Error('The session token payload is not valid JSON.');
+    }
+
+    if (
+        !claims ||
+        typeof claims !== 'object' ||
+        Array.isArray(claims) ||
+        typeof (claims as SessionTokenClaims).sub !== 'string' ||
+        (claims as SessionTokenClaims).v !== '2'
+    ) {
+        throw new Error('The token is not a Koamishin session token.');
+    }
+
+    return claims as SessionTokenClaims;
 }
 
 export function createKoamishinClient(

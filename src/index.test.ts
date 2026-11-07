@@ -1,5 +1,32 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { createKoamishinClient } from './index';
+import { createKoamishinClient, decodeSessionToken } from './index';
+
+const b64url = (value: string): string =>
+    btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+const sessionTokenJwt = (claims: Record<string, unknown>): string =>
+    `${b64url('{"alg":"RS256","kid":"key-a"}')}.${b64url(
+        JSON.stringify(claims),
+    )}.signature`;
+
+const sessionTokenClaims = (
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+    sub: 'user-1',
+    iss: 'https://portal.test',
+    iat: 1_700_000_000,
+    nbf: 1_700_000_000,
+    exp: 1_700_000_060,
+    jti: 'token-1',
+    sid: 'session-1',
+    v: '2',
+    fva: [0, -1],
+    sts: 'active',
+    tasks: [],
+    application_id: '100',
+    environment: 'production',
+    ...overrides,
+});
 
 afterEach(() => {
     vi.unstubAllGlobals();
@@ -483,4 +510,116 @@ test('rejects userinfo responses whose environment mismatches the configured pub
             'Userinfo environment does not match the configured publishable key.',
         );
     }
+});
+
+test('session tokens mint from the current access token', async () => {
+    const storage = new Map<string, string>([
+        [
+            'koamishin:https%3A%2F%2Fportal.test:app-a:access_token',
+            'access-secret',
+        ],
+    ]);
+    vi.stubGlobal('sessionStorage', {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+    });
+    const minted = {
+        token: 'header.payload.signature',
+        token_type: 'Bearer',
+        expires_in: 60,
+        expires_at: 1_700_000_060,
+    };
+    const fetchMock = vi.fn(async (url: string, options: RequestInit) => {
+        expect(url).toBe('https://portal.test/api/oauth/session-token');
+        expect(options.method).toBe('POST');
+        return { ok: true, json: async () => minted };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createKoamishinClient({
+        portalUrl: 'https://portal.test',
+        clientId: 'app-a',
+        redirectUri: 'https://app.test/callback',
+    });
+
+    expect(await client.getSessionToken()).toEqual(minted);
+    expect(await client.getSessionToken('explicit-secret')).toEqual(minted);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+        (fetchMock.mock.calls[0][1].headers as Record<string, string>)
+            .Authorization,
+    ).toBe('Bearer access-secret');
+    expect(
+        (fetchMock.mock.calls[1][1].headers as Record<string, string>)
+            .Authorization,
+    ).toBe('Bearer explicit-secret');
+});
+
+test('session token minting requires a sign-in', async () => {
+    vi.stubGlobal('sessionStorage', {
+        getItem: () => null,
+        setItem: () => undefined,
+        removeItem: () => undefined,
+    });
+
+    const client = createKoamishinClient({
+        portalUrl: 'https://portal.test',
+        clientId: 'app-a',
+        redirectUri: 'https://app.test/callback',
+    });
+
+    await expect(client.getSessionToken()).rejects.toThrow(
+        'No access token available.',
+    );
+});
+
+test('session token minting surfaces portal refusals', async () => {
+    vi.stubGlobal('sessionStorage', {
+        getItem: () => 'stale-secret',
+        setItem: () => undefined,
+        removeItem: () => undefined,
+    });
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+            ok: false,
+            text: async () => 'Only user tokens can mint session tokens.',
+        })),
+    );
+
+    const client = createKoamishinClient({
+        portalUrl: 'https://portal.test',
+        clientId: 'app-a',
+        redirectUri: 'https://app.test/callback',
+    });
+
+    await expect(client.getSessionToken()).rejects.toThrow(
+        'Session token mint failed: Only user tokens can mint session tokens.',
+    );
+});
+
+test('session token claims decode without verification', () => {
+    const claims = sessionTokenClaims();
+
+    expect(decodeSessionToken(sessionTokenJwt(claims))).toEqual(claims);
+    expect(
+        decodeSessionToken({
+            token: sessionTokenJwt(claims),
+            token_type: 'Bearer',
+            expires_in: 60,
+            expires_at: 1_700_000_060,
+        }),
+    ).toEqual(claims);
+    expect(decodeSessionToken(sessionTokenJwt(claims)).o).toBeUndefined();
+
+    expect(() => decodeSessionToken('not-a-jwt')).toThrow(
+        'The session token is not a JWT.',
+    );
+    expect(() => decodeSessionToken('a.!.c')).toThrow(
+        'The session token payload is not valid JSON.',
+    );
+    expect(() =>
+        decodeSessionToken(sessionTokenJwt({ sub: 'user-1', v: '1' })),
+    ).toThrow('The token is not a Koamishin session token.');
 });

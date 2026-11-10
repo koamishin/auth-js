@@ -1,5 +1,10 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { createKoamishinClient, decodeSessionToken } from './index';
+import {
+    SESSION_COOKIE_NAME,
+    createKoamishinClient,
+    decodeSessionToken,
+    verifySessionToken,
+} from './index';
 
 const b64url = (value: string): string =>
     btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -622,4 +627,150 @@ test('session token claims decode without verification', () => {
     expect(() =>
         decodeSessionToken(sessionTokenJwt({ sub: 'user-1', v: '1' })),
     ).toThrow('The token is not a Koamishin session token.');
+});
+
+test('verifySessionToken cryptographically verifies RS256 session tokens against JWKS and enforces claims', async () => {
+    const keyPair = await crypto.subtle.generateKey(
+        {
+            name: 'RSASSA-PKCS1-v1_5',
+            modulusLength: 2048,
+            publicExponent: new Uint8Array([1, 0, 1]),
+            hash: 'SHA-256',
+        },
+        true,
+        ['sign', 'verify'],
+    );
+    const publicJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+    const jwks = {
+        keys: [
+            {
+                kty: 'RSA',
+                alg: 'RS256',
+                use: 'sig',
+                kid: 'key-1',
+                n: publicJwk.n,
+                e: publicJwk.e,
+            },
+        ],
+    };
+
+    const signJwt = async (claims: Record<string, unknown>, kid = 'key-1') => {
+        const header = b64url(
+            JSON.stringify({ alg: 'RS256', typ: 'JWT', kid }),
+        );
+        const payload = b64url(JSON.stringify(claims));
+        const signingInput = new TextEncoder().encode(`${header}.${payload}`);
+        const sigBuffer = await crypto.subtle.sign(
+            'RSASSA-PKCS1-v1_5',
+            keyPair.privateKey,
+            signingInput,
+        );
+        const sigBytes = new Uint8Array(sigBuffer);
+        let binary = '';
+        for (let i = 0; i < sigBytes.length; i++) {
+            binary += String.fromCharCode(sigBytes[i]);
+        }
+        return `${header}.${payload}.${b64url(binary)}`;
+    };
+
+    const now = Math.floor(Date.now() / 1000);
+    const validClaims = sessionTokenClaims({
+        iss: 'https://portal.test',
+        iat: now - 5,
+        nbf: now - 5,
+        exp: now + 55,
+        environment: 'development',
+        application_id: '42',
+    });
+
+    const validJwt = await signJwt(validClaims);
+    const verified = await verifySessionToken(validJwt, {
+        portalUrl: 'https://portal.test/',
+        publishableKey: 'pk_test_example',
+        applicationId: '42',
+        jwks,
+    });
+    expect(verified).toEqual(validClaims);
+
+    // Tampered payload fails cryptographic verification
+    const tamperedParts = validJwt.split('.');
+    tamperedParts[1] = b64url(
+        JSON.stringify({ ...validClaims, sub: 'attacker' }),
+    );
+    await expect(
+        verifySessionToken(tamperedParts.join('.'), {
+            portalUrl: 'https://portal.test',
+            publishableKey: 'pk_test_example',
+            jwks,
+        }),
+    ).rejects.toThrow('Invalid session token signature.');
+
+    // Wrong environment rejected
+    await expect(
+        verifySessionToken(validJwt, {
+            portalUrl: 'https://portal.test',
+            publishableKey: 'pk_live_example',
+            jwks,
+        }),
+    ).rejects.toThrow(
+        'Session token environment does not match the configured environment.',
+    );
+
+    // Expired token rejected
+    const expiredJwt = await signJwt(
+        sessionTokenClaims({
+            iss: 'https://portal.test',
+            iat: now - 120,
+            nbf: now - 120,
+            exp: now - 60,
+            environment: 'development',
+        }),
+    );
+    await expect(
+        verifySessionToken(expiredJwt, {
+            portalUrl: 'https://portal.test',
+            publishableKey: 'pk_test_example',
+            jwks,
+        }),
+    ).rejects.toThrow('Session token has expired.');
+});
+
+test('syncSessionCookie writes and signOut clears the __koamishin_session cookie', async () => {
+    const storage = new Map<string, string>([
+        [
+            'koamishin:https%3A%2F%2Fportal.test:pk_test_123:access_token',
+            'access-1',
+        ],
+    ]);
+    vi.stubGlobal('sessionStorage', {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+    });
+    const doc = { cookie: '' };
+    vi.stubGlobal('document', doc);
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+            ok: true,
+            json: async () => ({
+                token: 'jwt.token.value',
+                token_type: 'Bearer',
+                expires_in: 60,
+                expires_at: 1_700_000_060,
+            }),
+        })),
+    );
+
+    const client = createKoamishinClient({
+        portalUrl: 'https://portal.test',
+        publishableKey: 'pk_test_123',
+        redirectUri: 'https://app.test/auth/callback',
+    });
+
+    await client.syncSessionCookie();
+    expect(doc.cookie).toContain(`${SESSION_COOKIE_NAME}=jwt.token.value`);
+
+    client.signOut();
+    expect(doc.cookie).toContain(`${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0`);
 });

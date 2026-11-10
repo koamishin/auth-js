@@ -63,6 +63,31 @@ export interface SessionTokenClaims {
     act?: { iss: string; sid: string; sub: string };
 }
 
+export const SESSION_COOKIE_NAME = '__koamishin_session';
+
+export interface JwksKey extends JsonWebKey {
+    kty: string;
+    alg?: string;
+    use?: string;
+    kid?: string;
+    n?: string;
+    e?: string;
+}
+
+export interface JwksDocument {
+    keys: JwksKey[];
+}
+
+export interface VerifySessionTokenOptions {
+    portalUrl: string;
+    publishableKey?: string;
+    clientId?: string;
+    applicationId?: string;
+    environment?: 'development' | 'production' | string;
+    jwks?: JwksDocument;
+    clockSkewSeconds?: number;
+}
+
 interface AuthenticationTransaction {
     verifier: string;
     createdAt: number;
@@ -221,6 +246,7 @@ export class KoamishinClient {
             this.storageKey('access_token'),
             tokens.access_token,
         );
+        sessionStorage.setItem(this.storageKey('user'), JSON.stringify(user));
         if (tokens.refresh_token) {
             sessionStorage.setItem(
                 this.storageKey('refresh_token'),
@@ -344,7 +370,65 @@ export class KoamishinClient {
             );
         }
 
+        if (typeof sessionStorage !== 'undefined') {
+            sessionStorage.setItem(
+                this.storageKey('user'),
+                JSON.stringify(user),
+            );
+        }
+
         return user;
+    }
+
+    /**
+     * Return the stored access token for this client, or null when signed out.
+     */
+    getStoredAccessToken(): string | null {
+        if (typeof sessionStorage === 'undefined') {
+            return null;
+        }
+
+        return sessionStorage.getItem(this.storageKey('access_token'));
+    }
+
+    /**
+     * Return the cached user profile from sessionStorage, or null when unavailable.
+     */
+    getStoredUser(): KoamishinUser | null {
+        if (typeof sessionStorage === 'undefined') {
+            return null;
+        }
+
+        const raw = sessionStorage.getItem(this.storageKey('user'));
+        if (!raw) {
+            return null;
+        }
+
+        try {
+            const parsed = JSON.parse(raw);
+            return parsed &&
+                typeof parsed === 'object' &&
+                !Array.isArray(parsed)
+                ? (parsed as KoamishinUser)
+                : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Mint a fresh short-lived session token and write it to the `__koamishin_session` cookie
+     * so SSR frameworks and Next.js proxy/middleware can verify the session offline.
+     */
+    async syncSessionCookie(token?: string): Promise<SessionToken> {
+        const sessionToken = await this.getSessionToken(token);
+
+        if (typeof document !== 'undefined') {
+            const maxAge = Math.max(1, sessionToken.expires_in || 60);
+            document.cookie = `${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionToken.token)}; Path=/; Max-Age=${maxAge}; SameSite=Lax`;
+        }
+
+        return sessionToken;
     }
 
     /**
@@ -354,9 +438,14 @@ export class KoamishinClient {
         if (typeof sessionStorage !== 'undefined') {
             sessionStorage.removeItem(this.storageKey('access_token'));
             sessionStorage.removeItem(this.storageKey('refresh_token'));
+            sessionStorage.removeItem(this.storageKey('user'));
             sessionStorage.removeItem(this.storageKey('oauth_state'));
             sessionStorage.removeItem(this.storageKey('code_verifier'));
             sessionStorage.removeItem(this.storageKey('oauth_transactions'));
+        }
+
+        if (typeof document !== 'undefined') {
+            document.cookie = `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax`;
         }
     }
 
@@ -439,6 +528,174 @@ export function decodeSessionToken(
     }
 
     return claims as SessionTokenClaims;
+}
+
+const jwksCache = new Map<string, { fetchedAt: number; jwks: JwksDocument }>();
+
+function decodeBase64UrlBytes(input: string): Uint8Array {
+    const base64 = input.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
+async function resolveJwks(
+    portalUrl: string,
+    forceRefresh = false,
+): Promise<JwksDocument> {
+    const normalized = portalUrl.replace(/\/+$/, '');
+    const cached = jwksCache.get(normalized);
+    const now = Date.now();
+
+    if (!forceRefresh && cached && now - cached.fetchedAt < 300_000) {
+        return cached.jwks;
+    }
+
+    const response = await fetch(`${normalized}/oauth/jwks`, {
+        headers: { Accept: 'application/json' },
+    });
+
+    if (!response.ok) {
+        throw new Error('Failed to fetch Koamishin JWKS document.');
+    }
+
+    const jwks = (await response.json()) as JwksDocument;
+    if (!jwks || !Array.isArray(jwks.keys)) {
+        throw new Error('Invalid Koamishin JWKS document.');
+    }
+
+    jwksCache.set(normalized, { fetchedAt: now, jwks });
+    return jwks;
+}
+
+/**
+ * Cryptographically verify a Koamishin session token (RS256 JWT) against the
+ * Portal's JWKS document and validate its issuer, lifetime, environment, and
+ * optional application binding.
+ */
+export async function verifySessionToken(
+    sessionToken: string | SessionToken,
+    options: VerifySessionTokenOptions,
+): Promise<SessionTokenClaims> {
+    const jwt =
+        typeof sessionToken === 'string' ? sessionToken : sessionToken.token;
+    const parts = jwt.split('.');
+    if (parts.length !== 3) {
+        throw new Error('The session token is not a JWT.');
+    }
+
+    let header: { alg?: string; kid?: string; typ?: string };
+    try {
+        const headerBytes = decodeBase64UrlBytes(parts[0]);
+        header = JSON.parse(new TextDecoder().decode(headerBytes));
+    } catch {
+        throw new Error('The session token header is not valid JSON.');
+    }
+
+    if (!header || header.alg !== 'RS256') {
+        throw new Error('Unsupported session token algorithm.');
+    }
+
+    const claims = decodeSessionToken(jwt);
+    const portalUrl = options.portalUrl.replace(/\/+$/, '');
+    const skew = options.clockSkewSeconds ?? 5;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    if (claims.iss.replace(/\/+$/, '') !== portalUrl) {
+        throw new Error('Session token issuer does not match portalUrl.');
+    }
+
+    if (typeof claims.exp !== 'number' || nowSeconds - skew >= claims.exp) {
+        throw new Error('Session token has expired.');
+    }
+
+    if (typeof claims.nbf === 'number' && nowSeconds + skew < claims.nbf) {
+        throw new Error('Session token is not active yet.');
+    }
+
+    const keyIdentifier =
+        options.publishableKey?.trim() || options.clientId?.trim() || '';
+    const inferredEnvironment = keyIdentifier.startsWith('pk_test_')
+        ? 'development'
+        : keyIdentifier.startsWith('pk_live_')
+          ? 'production'
+          : null;
+    const expectedEnvironment = options.environment ?? inferredEnvironment;
+
+    if (
+        expectedEnvironment &&
+        claims.environment &&
+        claims.environment !== expectedEnvironment
+    ) {
+        throw new Error(
+            'Session token environment does not match the configured environment.',
+        );
+    }
+
+    if (
+        options.applicationId &&
+        claims.application_id &&
+        String(claims.application_id) !== String(options.applicationId)
+    ) {
+        throw new Error(
+            'Session token application_id does not match the configured applicationId.',
+        );
+    }
+
+    let jwks = options.jwks ?? (await resolveJwks(portalUrl, false));
+    let jwk = jwks.keys.find(
+        (k) =>
+            k.kty === 'RSA' && (!header.kid || !k.kid || k.kid === header.kid),
+    );
+
+    if (!jwk && !options.jwks) {
+        jwks = await resolveJwks(portalUrl, true);
+        jwk = jwks.keys.find(
+            (k) =>
+                k.kty === 'RSA' &&
+                (!header.kid || !k.kid || k.kid === header.kid),
+        );
+    }
+
+    if (!jwk || !jwk.n || !jwk.e) {
+        throw new Error('No matching RSA key found in JWKS document.');
+    }
+
+    const cryptoKey = await crypto.subtle.importKey(
+        'jwk',
+        {
+            kty: 'RSA',
+            n: jwk.n,
+            e: jwk.e,
+            alg: 'RS256',
+            ext: true,
+        },
+        {
+            name: 'RSASSA-PKCS1-v1_5',
+            hash: 'SHA-256',
+        },
+        false,
+        ['verify'],
+    );
+
+    const signingInput = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
+    const signature = decodeBase64UrlBytes(parts[2]);
+    const valid = await crypto.subtle.verify(
+        'RSASSA-PKCS1-v1_5',
+        cryptoKey,
+        signature as BufferSource,
+        signingInput,
+    );
+
+    if (!valid) {
+        throw new Error('Invalid session token signature.');
+    }
+
+    return claims;
 }
 
 export function createKoamishinClient(

@@ -13,7 +13,8 @@ Official browser JavaScript and TypeScript SDK for **Koamishin Portal**, using O
 - **Standard PKCE**: High-security authorization code flow using standard Web Crypto API.
 - **Browser client**: Zero external runtime dependencies; compatible with browser code in React, Vue, Next.js, Nuxt, SvelteKit, and vanilla JS.
 - **Silent Refresh**: Built-in `refreshToken()` support to renew expired sessions.
-- **Session Tokens**: `getSessionToken()` mints sixty-second JWTs your backends verify offline against the JWKS document, instead of calling userinfo per request.
+- **Session Tokens**: `getSessionToken()` mints sixty-second JWTs your backends verify offline against the JWKS document (`verifySessionToken()`), instead of calling userinfo per request.
+- **Next.js App Router & Proxy Support**: `@koamishin/auth-js/nextjs` and `@koamishin/auth-js/nextjs/server` provide Clerk-style `<KoamishinProvider>`, `<Show>`, `<SignInButton>`, `<SignUpButton>`, `<UserButton>`, `<AuthenticateWithRedirectCallback />`, `koamishinMiddleware()`, `createRouteMatcher()`, and server `auth()`.
 - **Role & Tenant Aware**: Access Spatie roles, permissions, organization/application context, and public metadata inside frontend components.
 
 ---
@@ -135,12 +136,19 @@ window.location.href = '/';
 A session token is a short-lived JWT (60 seconds) your application's backends verify **offline** against the portal's JWKS document — no userinfo call per request:
 
 ```typescript
-import { decodeSessionToken } from '@koamishin/auth-js';
+import {
+  decodeSessionToken,
+  verifySessionToken,
+} from '@koamishin/auth-js';
 
 const sessionToken = await koamishin.getSessionToken();
 
-// Send sessionToken.token to your backend on each request;
-// it verifies the signature server-side before trusting the claims.
+// Verify cryptographically on your server or edge runtime against /oauth/jwks:
+const verifiedClaims = await verifySessionToken(sessionToken, {
+  portalUrl: process.env.NEXT_PUBLIC_KOAMISHIN_PORTAL_URL!,
+  publishableKey: process.env.NEXT_PUBLIC_KOAMISHIN_PUBLISHABLE_KEY!,
+});
+console.log(verifiedClaims.sub, verifiedClaims.sid, verifiedClaims.sts);
 
 // Browser-side decode is unverified — display and routing only:
 const claims = decodeSessionToken(sessionToken);
@@ -148,6 +156,116 @@ console.log(claims.sub, claims.sid, claims.sts);
 ```
 
 Backends should also check `application_id` and `environment` against their own configuration before trusting a token, since tokens are minted per application. See the Koamishin Auth session token documentation for the full claim set.
+
+---
+
+## Next.js App Router Quickstart (Clerk-Style)
+
+### 1. Configure `.env.local`
+
+```dotenv
+NEXT_PUBLIC_KOAMISHIN_PORTAL_URL=https://auth.company.internal
+NEXT_PUBLIC_KOAMISHIN_ENVIRONMENT=development
+NEXT_PUBLIC_KOAMISHIN_PUBLISHABLE_KEY=pk_test_your_publishable_key
+NEXT_PUBLIC_KOAMISHIN_REDIRECT_URI=http://localhost:3000/auth/callback
+```
+
+Add `transpilePackages: ['@koamishin/auth-js']` to `next.config.ts` when consuming TypeScript sources directly.
+
+### 2. Add `koamishinMiddleware()` to `proxy.ts` (or `middleware.ts` on Next.js <=15)
+
+```typescript
+import {
+  koamishinMiddleware,
+  createRouteMatcher,
+} from '@koamishin/auth-js/nextjs/server';
+
+const isProtectedRoute = createRouteMatcher(['/dashboard(.*)']);
+
+export default koamishinMiddleware(async (auth, req) => {
+  if (isProtectedRoute(req)) {
+    await auth.protect();
+  }
+});
+
+export const config = {
+  matcher: [
+    '/((?!_next|[^?]*\\.(?:html?|css|js(?!on)|jpe?g|webp|png|gif|svg|ttf|woff2?|ico|csv|docx?|xlsx?|zip|webmanifest)).*)',
+    '/(api|trpc)(.*)',
+  ],
+};
+```
+
+### 3. Add `<KoamishinProvider>` and Auth Components to `app/layout.tsx`
+
+```tsx
+import {
+  KoamishinProvider,
+  Show,
+  SignInButton,
+  SignUpButton,
+  UserButton,
+} from '@koamishin/auth-js/nextjs';
+import { Suspense } from 'react';
+import './globals.css';
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en" className="h-full antialiased">
+      <body className="min-h-full flex flex-col">
+        <KoamishinProvider>
+          <header className="flex justify-end items-center p-4 gap-4 h-16">
+            <Suspense>
+              <Show when="signed-out">
+                <SignInButton />
+                <SignUpButton>
+                  <button className="bg-purple-700 text-white rounded-full font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 cursor-pointer">
+                    Sign Up
+                  </button>
+                </SignUpButton>
+              </Show>
+              <Show when="signed-in">
+                <UserButton />
+              </Show>
+            </Suspense>
+          </header>
+          {children}
+        </KoamishinProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+### 4. Add Callback Route (`app/auth/callback/page.tsx`)
+
+```tsx
+import { Suspense } from 'react';
+import { AuthenticateWithRedirectCallback } from '@koamishin/auth-js/nextjs';
+
+export default function CallbackPage() {
+  return (
+    <Suspense>
+      <AuthenticateWithRedirectCallback afterSignInUrl="/dashboard" />
+    </Suspense>
+  );
+}
+```
+
+### 5. Read Verified Claims in Server & Client Components
+
+```tsx
+import { auth } from '@koamishin/auth-js/nextjs/server';
+
+export default async function DashboardPage() {
+  const { userId, sessionId, sessionClaims } = await auth();
+  return <pre>{JSON.stringify({ userId, sessionId, sessionClaims }, null, 2)}</pre>;
+}
+```
 
 ---
 
@@ -174,9 +292,14 @@ Backends should also check `application_id` and `environment` against their own 
 | `getUser(token?)` | `Promise<KoamishinUser>` | Fetches user claims from `/api/oauth/userinfo` and verifies `environment` matches any configured `pk_test_...` / `pk_live_...` key. |
 | `refreshToken(token?)` | `Promise<TokenResponse>` | Exchanges refresh token for new access token. |
 | `getSessionToken(token?)` | `Promise<SessionToken>` | Mints a short-lived session token (`POST /api/oauth/session-token`) for offline verification by your backends. |
-| `signOut()` | `void` | Clears stored tokens from browser session storage. |
+| `syncSessionCookie(token?)` | `Promise<SessionToken>` | Mints a fresh 60-second session token and writes it to the `__koamishin_session` cookie for SSR/proxy verification. |
+| `getStoredAccessToken()` | `string \| null` | Returns the stored OAuth access token for this client, or `null` when signed out. |
+| `getStoredUser()` | `KoamishinUser \| null` | Returns the cached user profile from `sessionStorage`, or `null` when unavailable. |
+| `signOut()` | `void` | Clears stored tokens from browser session storage and expires the `__koamishin_session` cookie. |
 
-The package also exports `decodeSessionToken(sessionToken)` → `SessionTokenClaims`, which decodes a session token's claims **without** verifying the signature. Use it for display and routing only; a backend must verify the token against the JWKS document before trusting any claim.
+The package also exports:
+- `verifySessionToken(sessionToken, options)` → `Promise<SessionTokenClaims>`: cryptographically verifies an RS256 session token against the Portal's `/oauth/jwks` endpoint and checks `iss`, `exp`, `nbf`, `environment`, and optional `applicationId`.
+- `decodeSessionToken(sessionToken)` → `SessionTokenClaims`: decodes a session token's claims **without** verifying the signature. Use it for display and routing only; a backend must verify the token against the JWKS document before trusting any claim.
 
 Browser storage is scoped by Portal URL and publishable key (or legacy client ID), keeping `pk_test_...` and `pk_live_...` sessions isolated on the same origin. This changes earlier unscoped storage keys, so users of earlier versions must sign in again. Remove the old `koamishin_access_token` and `koamishin_refresh_token` keys during migration if present. Local sign-out does not revoke Portal tokens or end other application sessions.
 

@@ -291,6 +291,7 @@ export default async function DashboardPage() {
 | `clientId` | `string` | Legacy fallback | Legacy OAuth 2.0 public client UUID when not using a publishable key. |
 | `redirectUri` | `string` | Yes | Exact callback URL registered for the application environment. |
 | `scopes` | `string[]` | No | Requested OAuth scopes (defaults to `['openid', 'profile', 'email', 'roles']`). |
+| `onTransition` | `(event: AuthTransitionEvent) => void \| Promise<void>` | No | Optional listener invoked on authentication lifecycle events. |
 
 ### `KoamishinClient`
 
@@ -307,6 +308,7 @@ export default async function DashboardPage() {
 | `getStoredAccessToken()` | `string \| null` | Returns the stored OAuth access token for this client, or `null` when signed out. |
 | `getStoredUser()` | `KoamishinUser \| null` | Returns the cached user profile from `sessionStorage`, or `null` when unavailable. |
 | `signOut()` | `Promise<SignOutResult>` | Immediately clears local session state, then reports `revoked`, `failed`, or `reauthentication_required`. Await it before navigating. |
+| `onTransition(listener)` | `() => void` | Subscribes a listener to authentication lifecycle transitions (`token_exchange`, `token_refresh`, `refresh_failure`, `sign_out`, `session_invalidated`, `generation_change`). Returns an unsubscribe function. |
 
 The package also exports:
 - `verifySessionToken(sessionToken, options)` → `Promise<SessionTokenClaims>`: cryptographically verifies an RS256 session token against the Portal's `/oauth/jwks` endpoint and checks `iss`, `exp`, `nbf`, `environment`, and optional `applicationId`.

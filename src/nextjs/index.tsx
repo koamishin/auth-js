@@ -10,14 +10,24 @@ import React, {
     useState,
 } from 'react';
 import {
+    AuthTransitionEvent,
+    AuthTransitionListener,
     KoamishinClient,
     KoamishinUser,
     SessionTokenClaims,
+    SignOutResult,
     createKoamishinClient,
     decodeSessionToken,
 } from '../index';
 
+export type { AuthTransitionEvent, AuthTransitionListener };
+import { safeReturnPath } from './redirect';
+import { assertCompatibleClientIdentifiers, scopesConfigurationKey } from './config';
+import { claimCallbackNavigation, isCallbackEffectCurrent } from './callback-navigation';
+import { hydrationFailureAction } from './hydration';
+
 const RETURN_TO_STORAGE_KEY = 'koamishin:return_to';
+const callbackSessionChecks = new WeakMap<Promise<KoamishinUser>, () => boolean>();
 
 export interface KoamishinContextValue {
     client: KoamishinClient | null;
@@ -28,8 +38,9 @@ export interface KoamishinContextValue {
     error: string | null;
     signIn: (options?: { redirectUrl?: string }) => Promise<void>;
     signUp: (options?: { redirectUrl?: string }) => Promise<void>;
-    signOut: (options?: { redirectUrl?: string }) => void;
+    signOut: (options?: { redirectUrl?: string }) => Promise<SignOutResult>;
     completeCallback: () => Promise<KoamishinUser>;
+    onTransition: (listener: AuthTransitionListener) => () => void;
 }
 
 const KoamishinContext = createContext<KoamishinContextValue | undefined>(
@@ -43,6 +54,7 @@ export interface KoamishinProviderProps {
     clientId?: string;
     redirectUri?: string;
     scopes?: string[];
+    onTransition?: AuthTransitionListener;
 }
 
 /**
@@ -51,7 +63,7 @@ export interface KoamishinProviderProps {
  * Mirrors Clerk's `<ClerkProvider>` in `app/layout.tsx`:
  * - Initializes the Koamishin PKCE client from `NEXT_PUBLIC_KOAMISHIN_*` env vars,
  * - Hydrates the signed-in user from sessionStorage and `/api/oauth/userinfo`,
- * - Mints and rotates the 60-second RS256 `__koamishin_session` cookie so
+ * - Mints and rotates the 60-second client-scoped RS256 session cookie so
  *   Next.js `proxy.ts` (`koamishinMiddleware`) and Server Components (`auth()`)
  *   can verify the session offline against `/oauth/jwks`.
  */
@@ -62,6 +74,7 @@ export function KoamishinProvider({
     clientId,
     redirectUri,
     scopes,
+    onTransition,
 }: KoamishinProviderProps) {
     const resolvedPortalUrl =
         portalUrl ?? process.env.NEXT_PUBLIC_KOAMISHIN_PORTAL_URL ?? '';
@@ -77,8 +90,10 @@ export function KoamishinProvider({
         (typeof window !== 'undefined'
             ? `${window.location.origin}/auth/callback`
             : 'http://localhost:3000/auth/callback');
+    const scopesKey = scopesConfigurationKey(scopes);
 
     const client = useMemo(() => {
+        assertCompatibleClientIdentifiers(resolvedPublishableKey, resolvedClientId);
         const key = resolvedPublishableKey || resolvedClientId;
         if (!resolvedPortalUrl || !key) {
             return null;
@@ -87,7 +102,7 @@ export function KoamishinProvider({
             const baseConfig = {
                 portalUrl: resolvedPortalUrl,
                 redirectUri: resolvedRedirectUri,
-                scopes: scopes ?? ['openid', 'profile', 'email', 'roles'],
+                scopes: JSON.parse(scopesKey) as string[],
             };
             return createKoamishinClient(
                 resolvedPublishableKey
@@ -103,7 +118,7 @@ export function KoamishinProvider({
         resolvedPublishableKey,
         resolvedClientId,
         resolvedRedirectUri,
-        scopes,
+        scopesKey,
     ]);
 
     const [user, setUser] = useState<KoamishinUser | null>(null);
@@ -111,15 +126,29 @@ export function KoamishinProvider({
         useState<SessionTokenClaims | null>(null);
     const [isLoaded, setIsLoaded] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
+    const sessionVersion = useRef(0);
+    const activeClientRef = useRef(client);
+    activeClientRef.current = client;
+    const callbackInFlight = useRef<{ client: KoamishinClient; version: number; promise: Promise<KoamishinUser> } | null>(null);
 
     const syncCookieAndClaims = useCallback(
-        async (activeClient: KoamishinClient, accessToken?: string) => {
+        async (activeClient: KoamishinClient, accessToken?: string, required = false) => {
+            const version = sessionVersion.current;
             try {
                 const minted =
-                    await activeClient.syncSessionCookie(accessToken);
-                setSessionClaims(decodeSessionToken(minted));
+                    await activeClient.syncSessionCookie(accessToken, () =>
+                        activeClient === activeClientRef.current && version === sessionVersion.current,
+                    );
+                if (version === sessionVersion.current && activeClient === activeClientRef.current) {
+                    setSessionClaims(decodeSessionToken(minted));
+                }
             } catch {
-                // Session token endpoint is optional if offline
+                if (required) {
+                    throw new Error('Unable to establish the server session. Retry sign-in.');
+                }
+                if (version === sessionVersion.current && activeClient === activeClientRef.current) {
+                    setError('Unable to establish the server session. Some pages may require sign-in again.');
+                }
             }
         },
         [],
@@ -147,10 +176,11 @@ export function KoamishinProvider({
             const authAction = params.get('auth');
             const redirectTarget = params.get('redirect_url');
             if (authAction === 'signin' || authAction === 'signup') {
-                if (redirectTarget && typeof sessionStorage !== 'undefined') {
+                const safeTarget = safeReturnPath(redirectTarget);
+                if (safeTarget && typeof sessionStorage !== 'undefined') {
                     sessionStorage.setItem(
                         RETURN_TO_STORAGE_KEY,
-                        redirectTarget,
+                        safeTarget,
                     );
                 }
                 params.delete('auth');
@@ -160,9 +190,15 @@ export function KoamishinProvider({
                 window.history.replaceState({}, '', cleanUrl);
 
                 if (authAction === 'signup') {
-                    void client.redirectToSignUp();
+                    void client.redirectToSignUp().catch(() => {
+                        setError('Unable to start sign-up.');
+                        setIsLoaded(true);
+                    });
                 } else {
-                    void client.redirectToSignIn();
+                    void client.redirectToSignIn().catch(() => {
+                        setError('Unable to start sign-in.');
+                        setIsLoaded(true);
+                    });
                 }
                 return;
             }
@@ -183,32 +219,41 @@ export function KoamishinProvider({
         }
 
         let cancelled = false;
+        const version = sessionVersion.current;
 
         (async () => {
             try {
                 const freshUser = await client.getUser(storedToken);
-                if (cancelled) return;
+                if (cancelled || version !== sessionVersion.current) return;
                 setUser(freshUser);
                 setError(null);
                 await syncCookieAndClaims(client, storedToken);
-            } catch {
+            } catch (error) {
+                if (cancelled || version !== sessionVersion.current) return;
+                if (hydrationFailureAction('userinfo', error) !== 'refresh') {
+                    setError('Unable to verify the session. Retry when the service is available.');
+                    return;
+                }
                 try {
                     const refreshed = await client.refreshToken();
                     const freshUser = await client.getUser(
                         refreshed.access_token,
                     );
-                    if (cancelled) return;
+                    if (cancelled || version !== sessionVersion.current) return;
                     setUser(freshUser);
                     setError(null);
                     await syncCookieAndClaims(client, refreshed.access_token);
                 } catch (err) {
-                    if (cancelled) return;
-                    client.signOut();
-                    setUser(null);
-                    setSessionClaims(null);
-                    setError(
-                        err instanceof Error ? err.message : 'Session expired',
-                    );
+                    if (cancelled || version !== sessionVersion.current) return;
+                    if (hydrationFailureAction('refresh', err) === 'reauthenticate') {
+                        if (!client.invalidateSession(storedToken)) return;
+                        sessionVersion.current++;
+                        setUser(null);
+                        setSessionClaims(null);
+                        setError('Session expired. Sign in again.');
+                    } else {
+                        setError('Unable to refresh the session. Retry when the service is available.');
+                    }
                 }
             } finally {
                 if (!cancelled) {
@@ -238,17 +283,24 @@ export function KoamishinProvider({
     const signIn = useCallback(
         async (options?: { redirectUrl?: string }) => {
             if (!client) {
+                setError('KoamishinClient is not configured.');
                 throw new Error(
                     'KoamishinClient is not configured. Check NEXT_PUBLIC_KOAMISHIN_PORTAL_URL and NEXT_PUBLIC_KOAMISHIN_PUBLISHABLE_KEY.',
                 );
             }
-            if (options?.redirectUrl && typeof sessionStorage !== 'undefined') {
+            const target = safeReturnPath(options?.redirectUrl);
+            if (target && typeof sessionStorage !== 'undefined') {
                 sessionStorage.setItem(
                     RETURN_TO_STORAGE_KEY,
-                    options.redirectUrl,
+                    target,
                 );
             }
-            await client.redirectToSignIn();
+            try {
+                await client.redirectToSignIn();
+            } catch {
+                setError('Unable to start sign-in.');
+                throw new Error('Unable to start sign-in.');
+            }
         },
         [client],
     );
@@ -256,46 +308,107 @@ export function KoamishinProvider({
     const signUp = useCallback(
         async (options?: { redirectUrl?: string }) => {
             if (!client) {
+                setError('KoamishinClient is not configured.');
                 throw new Error(
                     'KoamishinClient is not configured. Check NEXT_PUBLIC_KOAMISHIN_PORTAL_URL and NEXT_PUBLIC_KOAMISHIN_PUBLISHABLE_KEY.',
                 );
             }
-            if (options?.redirectUrl && typeof sessionStorage !== 'undefined') {
+            const target = safeReturnPath(options?.redirectUrl);
+            if (target && typeof sessionStorage !== 'undefined') {
                 sessionStorage.setItem(
                     RETURN_TO_STORAGE_KEY,
-                    options.redirectUrl,
+                    target,
                 );
             }
-            await client.redirectToSignUp();
+            try {
+                await client.redirectToSignUp();
+            } catch {
+                setError('Unable to start sign-up.');
+                throw new Error('Unable to start sign-up.');
+            }
         },
         [client],
     );
 
     const signOut = useCallback(
-        (options?: { redirectUrl?: string }) => {
-            client?.signOut();
+        async (options?: { redirectUrl?: string }): Promise<SignOutResult> => {
+            sessionVersion.current++;
+            const version = sessionVersion.current;
+            const request = client?.signOut() ?? Promise.resolve<SignOutResult>({ status: 'reauthentication_required' });
             setUser(null);
             setSessionClaims(null);
-            if (typeof window !== 'undefined') {
-                window.location.href = options?.redirectUrl ?? '/';
+            const result = await request;
+            if (version !== sessionVersion.current || activeClientRef.current !== client) return result;
+            setError(result.status === 'failed'
+                ? result.message
+                : result.status === 'reauthentication_required'
+                  ? 'Remote sign-out could not be confirmed. Sign in again to enable remote sign-out.'
+                  : null);
+            if (result.status === 'revoked' && typeof window !== 'undefined') {
+                window.location.href = safeReturnPath(options?.redirectUrl) ?? '/';
             }
+            return result;
         },
         [client],
     );
 
-    const completeCallback = useCallback(async (): Promise<KoamishinUser> => {
+    const completeCallback = useCallback((): Promise<KoamishinUser> => {
         if (!client) {
-            throw new Error('KoamishinClient is not configured.');
+            return Promise.reject(new Error('KoamishinClient is not configured.'));
+        }
+        if (callbackInFlight.current?.client === client && callbackInFlight.current.version === sessionVersion.current) {
+            return callbackInFlight.current.promise;
         }
 
+        const version = ++sessionVersion.current;
+        const promise = (async () => {
         const { user: authenticatedUser, tokens } =
-            await client.handleRedirectCallback();
-        await syncCookieAndClaims(client, tokens.access_token);
+            await client.handleRedirectCallback(() =>
+                version === sessionVersion.current && activeClientRef.current === client,
+            );
+        if (version !== sessionVersion.current || activeClientRef.current !== client) {
+            throw new Error('Session changed during the request.');
+        }
+        setUser(null);
+        setSessionClaims(null);
+        try {
+            await syncCookieAndClaims(client, tokens.access_token, true);
+        } catch (error) {
+            if (version === sessionVersion.current && activeClientRef.current === client) {
+                setError('Unable to establish the server session. Retry sign-in.');
+            }
+            throw error;
+        }
+        if (version !== sessionVersion.current || activeClientRef.current !== client) {
+            throw new Error('Session changed during the request.');
+        }
         setUser(authenticatedUser);
         setError(null);
         setIsLoaded(true);
         return authenticatedUser;
+        })();
+        callbackInFlight.current = { client, version, promise };
+        callbackSessionChecks.set(promise, () =>
+            activeClientRef.current === client && sessionVersion.current === version,
+        );
+        void promise.finally(() => {
+            if (callbackInFlight.current?.promise === promise) callbackInFlight.current = null;
+        }).catch(() => {});
+        return promise;
     }, [client, syncCookieAndClaims]);
+
+    const onTransitionCallback = useCallback(
+        (listener: AuthTransitionListener) => {
+            if (!client) return () => {};
+            return client.onTransition(listener);
+        },
+        [client],
+    );
+
+    useEffect(() => {
+        if (!client || !onTransition) return;
+        return client.onTransition(onTransition);
+    }, [client, onTransition]);
 
     const value = useMemo<KoamishinContextValue>(
         () => ({
@@ -309,6 +422,7 @@ export function KoamishinProvider({
             signUp,
             signOut,
             completeCallback,
+            onTransition: onTransitionCallback,
         }),
         [
             client,
@@ -320,6 +434,7 @@ export function KoamishinProvider({
             signUp,
             signOut,
             completeCallback,
+            onTransitionCallback,
         ],
     );
 
@@ -414,7 +529,7 @@ export function SignInButton({
     const { signIn } = useKoamishin();
 
     const handleClick = () => {
-        void signIn({ redirectUrl });
+        void signIn({ redirectUrl }).catch(() => {});
     };
 
     if (children) {
@@ -454,7 +569,7 @@ export function SignUpButton({
     const { signUp } = useKoamishin();
 
     const handleClick = () => {
-        void signUp({ redirectUrl });
+        void signUp({ redirectUrl }).catch(() => {});
     };
 
     if (children) {
@@ -487,7 +602,7 @@ export function UserButton({
 }: {
     afterSignOutUrl?: string;
 }) {
-    const { user, signOut } = useKoamishin();
+    const { user, signOut, error } = useKoamishin();
     const [open, setOpen] = useState(false);
     const containerRef = useRef<HTMLDivElement>(null);
 
@@ -505,7 +620,7 @@ export function UserButton({
     }, []);
 
     if (!user) {
-        return null;
+        return error ? <p role="alert">{error}</p> : null;
     }
 
     const initials = (user.name || user.email || 'U')
@@ -520,6 +635,7 @@ export function UserButton({
             ref={containerRef}
             className="relative z-50 inline-block text-left"
         >
+            {error && <p role="alert">{error}</p>}
             <button
                 type="button"
                 onClick={() => setOpen((prev) => !prev)}
@@ -585,7 +701,7 @@ export function UserButton({
                             type="button"
                             onClick={() => {
                                 setOpen(false);
-                                signOut({ redirectUrl: afterSignOutUrl });
+                                void signOut({ redirectUrl: afterSignOutUrl });
                             }}
                             className="flex w-full items-center rounded-lg px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40 cursor-pointer"
                         >
@@ -606,18 +722,24 @@ export function AuthenticateWithRedirectCallback({
 }: {
     afterSignInUrl?: string;
 }) {
-    const { completeCallback } = useKoamishin();
+    const { client, completeCallback } = useKoamishin();
     const [error, setError] = useState<string | null>(null);
-    const hasRunRef = useRef(false);
+    const completionRef = useRef<{ client: KoamishinClient; promise: Promise<KoamishinUser> } | null>(null);
 
     useEffect(() => {
-        if (hasRunRef.current) {
+        if (!client) {
+            setError('KoamishinClient is not configured.');
             return;
         }
-        hasRunRef.current = true;
-
-        completeCallback()
+        setError(null);
+        let active = true;
+        if (completionRef.current?.client !== client) {
+            completionRef.current = { client, promise: completeCallback() };
+        }
+        const completion = completionRef.current.promise;
+        completion
             .then(() => {
+                if (!claimCallbackNavigation(completion, active, callbackSessionChecks.get(completion)?.() === true)) return;
                 const returnTo =
                     typeof sessionStorage !== 'undefined'
                         ? sessionStorage.getItem(RETURN_TO_STORAGE_KEY)
@@ -625,16 +747,18 @@ export function AuthenticateWithRedirectCallback({
                 if (returnTo && typeof sessionStorage !== 'undefined') {
                     sessionStorage.removeItem(RETURN_TO_STORAGE_KEY);
                 }
-                window.location.replace(returnTo || afterSignInUrl);
+                window.location.replace(safeReturnPath(returnTo) ?? safeReturnPath(afterSignInUrl) ?? '/');
             })
             .catch((err) => {
+                if (!isCallbackEffectCurrent(active, callbackSessionChecks.get(completion)?.() === true)) return;
                 setError(
                     err instanceof Error
                         ? err.message
                         : 'Authentication callback failed.',
                 );
             });
-    }, [afterSignInUrl, completeCallback]);
+        return () => { active = false; };
+    }, [afterSignInUrl, client, completeCallback]);
 
     return (
         <div className="flex min-h-[60vh] items-center justify-center font-sans">

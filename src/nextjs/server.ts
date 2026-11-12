@@ -3,12 +3,16 @@ import type { NextRequest } from 'next/server';
 import { cookies, headers } from 'next/headers';
 import {
     SESSION_COOKIE_NAME,
+    KoamishinClient,
+    getSessionCookieName,
+    normalizePortalUrl,
     SessionTokenClaims,
     decodeSessionToken,
     verifySessionToken,
 } from '../index';
+import { assertCompatibleClientIdentifiers } from './config';
 
-export { SESSION_COOKIE_NAME, decodeSessionToken, verifySessionToken };
+export { SESSION_COOKIE_NAME, getSessionCookieName, decodeSessionToken, verifySessionToken };
 export type { SessionTokenClaims };
 
 const HEADER_AUTH_STATUS = 'x-koamishin-auth-status';
@@ -67,14 +71,16 @@ function resolveEnvConfig(options?: KoamishinMiddlewareOptions) {
         process.env.NEXT_PUBLIC_KOAMISHIN_CLIENT_ID ??
         process.env.KOAMISHIN_CLIENT_ID ??
         '';
-    const applicationId =
-        options?.applicationId ??
-        process.env.NEXT_PUBLIC_KOAMISHIN_APPLICATION_ID ??
-        process.env.KOAMISHIN_APPLICATION_ID;
-    const environment =
-        options?.environment ??
-        process.env.NEXT_PUBLIC_KOAMISHIN_ENVIRONMENT ??
-        process.env.KOAMISHIN_ENVIRONMENT;
+    const applicationId = [
+        options?.applicationId,
+        process.env.NEXT_PUBLIC_KOAMISHIN_APPLICATION_ID,
+        process.env.KOAMISHIN_APPLICATION_ID,
+    ].find((value) => value?.trim())?.trim();
+    const environment = [
+        options?.environment,
+        process.env.NEXT_PUBLIC_KOAMISHIN_ENVIRONMENT,
+        process.env.KOAMISHIN_ENVIRONMENT,
+    ].find((value) => value?.trim())?.trim();
 
     return {
         portalUrl,
@@ -83,6 +89,72 @@ function resolveEnvConfig(options?: KoamishinMiddlewareOptions) {
         applicationId,
         environment,
     };
+}
+
+function requireServerConfig(options?: KoamishinMiddlewareOptions) {
+    const config = resolveEnvConfig(options);
+    if (!config.portalUrl.trim()) {
+        throw new Error('Koamishin server authentication requires a Portal URL.');
+    }
+    if (!config.applicationId) {
+        throw new Error('Koamishin server authentication requires KOAMISHIN_APPLICATION_ID or an applicationId option.');
+    }
+    assertCompatibleClientIdentifiers(config.publishableKey, config.clientId);
+    const identifier = config.publishableKey.trim() || config.clientId.trim();
+    if (!identifier || identifier.startsWith('sk_')) {
+        throw new Error('Koamishin server authentication requires the same public client identifier configured in the browser.');
+    }
+    for (const [label, values] of [
+        ['application ID', [options?.applicationId, process.env.NEXT_PUBLIC_KOAMISHIN_APPLICATION_ID, process.env.KOAMISHIN_APPLICATION_ID]],
+        ['environment', [options?.environment, process.env.NEXT_PUBLIC_KOAMISHIN_ENVIRONMENT, process.env.KOAMISHIN_ENVIRONMENT]],
+        ['client ID', [options?.clientId, process.env.NEXT_PUBLIC_KOAMISHIN_CLIENT_ID, process.env.KOAMISHIN_CLIENT_ID]],
+        ['publishable key', [options?.publishableKey, process.env.NEXT_PUBLIC_KOAMISHIN_PUBLISHABLE_KEY, process.env.KOAMISHIN_PUBLISHABLE_KEY]],
+    ] as const) {
+        if (new Set(values.map((value) => value?.trim()).filter(Boolean)).size > 1) {
+            throw new Error(`Koamishin ${label} configuration conflicts between options and environment variables.`);
+        }
+    }
+    const inferredEnvironment = new KoamishinClient({
+        portalUrl: config.portalUrl,
+        clientId: identifier,
+        redirectUri: 'http://localhost',
+    }).getEnvironment();
+    if (config.environment && inferredEnvironment && config.environment !== inferredEnvironment) {
+        throw new Error('Koamishin environment conflicts with the publishable key environment.');
+    }
+    for (const [label, publicValue, serverValue] of [
+        ['publishable key', process.env.NEXT_PUBLIC_KOAMISHIN_PUBLISHABLE_KEY, process.env.KOAMISHIN_PUBLISHABLE_KEY],
+        ['client ID', process.env.NEXT_PUBLIC_KOAMISHIN_CLIENT_ID, process.env.KOAMISHIN_CLIENT_ID],
+    ]) {
+        if (publicValue?.trim() && serverValue?.trim() && publicValue.trim() !== serverValue.trim()) {
+            throw new Error(`Koamishin ${label} differs between browser and server configuration.`);
+        }
+    }
+    const browserIdentifier = process.env.NEXT_PUBLIC_KOAMISHIN_PUBLISHABLE_KEY?.trim() ||
+        process.env.NEXT_PUBLIC_KOAMISHIN_CLIENT_ID?.trim();
+    if (browserIdentifier && browserIdentifier !== identifier) {
+        throw new Error('Koamishin client identifier differs between browser and server configuration.');
+    }
+    const portalUrls = [
+        options?.portalUrl,
+        process.env.NEXT_PUBLIC_KOAMISHIN_PORTAL_URL,
+        process.env.KOAMISHIN_PORTAL_URL,
+    ].filter((value): value is string => Boolean(value?.trim()))
+        .map(normalizePortalUrl);
+    if (new Set(portalUrls).size > 1) {
+        throw new Error('Koamishin Portal URL differs between browser and server configuration.');
+    }
+    if (!config.environment && !identifier.startsWith('pk_test_') && !identifier.startsWith('pk_live_')) {
+        throw new Error('Koamishin server authentication requires KOAMISHIN_ENVIRONMENT, an environment option, or a test/live publishable key.');
+    }
+    return config;
+}
+
+function selectSessionToken(cookie: string | undefined, authorization: string | null): string | null {
+    if (authorization !== null) {
+        return /^Bearer\s+(\S+)$/i.exec(authorization)?.[1] ?? null;
+    }
+    return cookie ? decodeURIComponent(cookie) : null;
 }
 
 function buildSignInRedirect(
@@ -126,9 +198,8 @@ export function createRouteMatcher(
  * Next.js Proxy / Middleware for Koamishin authentication.
  *
  * Mirrors Clerk's `clerkMiddleware()`:
- * - By default leaves all routes public while verifying `__koamishin_session`
- *   offline against the Portal's JWKS document and forwarding claims to
- *   Server Components.
+ * - By default leaves all routes public while verifying the client-scoped cookie
+ *   offline against the Portal's JWKS document.
  * - Accepts an optional `(auth, req)` callback so specific routes can be
  *   protected via `await auth.protect()`.
  */
@@ -144,27 +215,24 @@ export function koamishinMiddleware(
             : handlerOrOptions;
 
     return async function proxy(request: NextRequest): Promise<Response> {
-        const cookieToken = request.cookies.get(SESSION_COOKIE_NAME)?.value;
+        const envConfig = requireServerConfig(options);
+        const identifier = envConfig.publishableKey.trim() || envConfig.clientId.trim();
+        const cookieToken = request.cookies.get(getSessionCookieName(envConfig.portalUrl, identifier))?.value;
         const authHeader = request.headers.get('authorization');
-        const bearerToken = authHeader?.startsWith('Bearer ')
-            ? authHeader.slice(7).trim()
-            : undefined;
-        const rawToken = cookieToken
-            ? decodeURIComponent(cookieToken)
-            : bearerToken;
-
-        const envConfig = resolveEnvConfig(options);
         let claims: SessionTokenClaims | null = null;
 
-        if (rawToken && envConfig.portalUrl) {
+        if (envConfig.portalUrl) {
             try {
-                claims = await verifySessionToken(rawToken, {
-                    portalUrl: envConfig.portalUrl,
-                    publishableKey: envConfig.publishableKey || undefined,
-                    clientId: envConfig.clientId || undefined,
-                    applicationId: envConfig.applicationId,
-                    environment: envConfig.environment,
-                });
+                const rawToken = selectSessionToken(cookieToken, authHeader);
+                if (rawToken) {
+                    claims = await verifySessionToken(rawToken, {
+                        portalUrl: envConfig.portalUrl,
+                        publishableKey: envConfig.publishableKey || undefined,
+                        clientId: envConfig.clientId || undefined,
+                        applicationId: envConfig.applicationId,
+                        environment: envConfig.environment,
+                    });
+                }
             } catch {
                 claims = null;
             }
@@ -211,13 +279,10 @@ export function koamishinMiddleware(
         }
 
         const requestHeaders = new Headers(request.headers);
-        requestHeaders.set(
-            HEADER_AUTH_STATUS,
-            authObject.isAuthenticated ? 'signed-in' : 'signed-out',
-        );
-        requestHeaders.set(HEADER_USER_ID, authObject.userId ?? '');
-        requestHeaders.set(HEADER_SESSION_ID, authObject.sessionId ?? '');
-        requestHeaders.set(HEADER_CLAIMS, claims ? JSON.stringify(claims) : '');
+        requestHeaders.delete(HEADER_AUTH_STATUS);
+        requestHeaders.delete(HEADER_USER_ID);
+        requestHeaders.delete(HEADER_SESSION_ID);
+        requestHeaders.delete(HEADER_CLAIMS);
 
         return NextResponse.next({
             request: {
@@ -237,47 +302,16 @@ export async function auth(options?: KoamishinMiddlewareOptions): Promise<{
     sessionClaims: SessionTokenClaims | null;
     isAuthenticated: boolean;
 }> {
+    const envConfig = requireServerConfig(options);
     const headerStore = await headers();
-    const status = headerStore.get(HEADER_AUTH_STATUS);
-    const serializedClaims = headerStore.get(HEADER_CLAIMS);
-
-    if (status === 'signed-in' && serializedClaims) {
-        try {
-            const parsed = JSON.parse(serializedClaims) as SessionTokenClaims;
-            return {
-                userId: parsed.sub,
-                sessionId: parsed.sid,
-                sessionClaims: parsed,
-                isAuthenticated: true,
-            };
-        } catch {
-            // Fall through to cookie verification
-        }
-    }
-
     const cookieStore = await cookies();
-    const rawCookie = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    if (!rawCookie) {
-        return {
-            userId: null,
-            sessionId: null,
-            sessionClaims: null,
-            isAuthenticated: false,
-        };
-    }
-
-    const envConfig = resolveEnvConfig(options);
-    if (!envConfig.portalUrl) {
-        return {
-            userId: null,
-            sessionId: null,
-            sessionClaims: null,
-            isAuthenticated: false,
-        };
-    }
-
+    const identifier = envConfig.publishableKey.trim() || envConfig.clientId.trim();
+    const rawCookie = cookieStore.get(getSessionCookieName(envConfig.portalUrl, identifier))?.value;
+    const authorization = headerStore.get('authorization');
     try {
-        const claims = await verifySessionToken(decodeURIComponent(rawCookie), {
+        const rawToken = selectSessionToken(rawCookie, authorization);
+        if (!rawToken) throw new Error('No session token.');
+        const claims = await verifySessionToken(rawToken, {
             portalUrl: envConfig.portalUrl,
             publishableKey: envConfig.publishableKey || undefined,
             clientId: envConfig.clientId || undefined,

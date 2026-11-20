@@ -137,7 +137,7 @@ export function KoamishinProvider({
             const isCurrent = () => activeClient === activeClientRef.current && version === sessionVersion.current;
 
             try {
-                let minted: string;
+                let minted: Awaited<ReturnType<KoamishinClient['syncSessionCookie']>>;
                 try {
                     minted = await activeClient.syncSessionCookie(accessToken, isCurrent);
                 } catch {

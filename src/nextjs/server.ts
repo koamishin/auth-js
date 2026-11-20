@@ -292,11 +292,7 @@ export function koamishinMiddleware(
     };
 }
 
-/**
- * Read verified session claims inside Next.js Server Components, Route Handlers,
- * or Server Actions (Clerk-style `await auth()`).
- */
-export async function auth(options?: KoamishinMiddlewareOptions): Promise<{
+async function resolveAuth(options?: KoamishinMiddlewareOptions): Promise<{
     userId: string | null;
     sessionId: string | null;
     sessionClaims: SessionTokenClaims | null;
@@ -332,4 +328,17 @@ export async function auth(options?: KoamishinMiddlewareOptions): Promise<{
             isAuthenticated: false,
         };
     }
+}
+
+/**
+ * Read verified session claims inside Next.js Server Components, Route Handlers,
+ * or Server Actions (Clerk-style `await auth()`).
+ */
+export async function auth(options?: KoamishinMiddlewareOptions): Promise<{
+    userId: string | null;
+    sessionId: string | null;
+    sessionClaims: SessionTokenClaims | null;
+    isAuthenticated: boolean;
+}> {
+    return resolveAuth(options);
 }

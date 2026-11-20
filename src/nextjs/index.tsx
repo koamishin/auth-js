@@ -134,19 +134,27 @@ export function KoamishinProvider({
     const syncCookieAndClaims = useCallback(
         async (activeClient: KoamishinClient, accessToken?: string, required = false) => {
             const version = sessionVersion.current;
+            const isCurrent = () => activeClient === activeClientRef.current && version === sessionVersion.current;
+
             try {
-                const minted =
-                    await activeClient.syncSessionCookie(accessToken, () =>
-                        activeClient === activeClientRef.current && version === sessionVersion.current,
-                    );
-                if (version === sessionVersion.current && activeClient === activeClientRef.current) {
+                let minted: string;
+                try {
+                    minted = await activeClient.syncSessionCookie(accessToken, isCurrent);
+                } catch {
+                    if (accessToken || !isCurrent()) {
+                        throw new Error('Session sync failed');
+                    }
+                    await activeClient.refreshToken();
+                    minted = await activeClient.syncSessionCookie(undefined, isCurrent);
+                }
+                if (isCurrent()) {
                     setSessionClaims(decodeSessionToken(minted));
                 }
             } catch {
                 if (required) {
                     throw new Error('Unable to establish the server session. Retry sign-in.');
                 }
-                if (version === sessionVersion.current && activeClient === activeClientRef.current) {
+                if (isCurrent()) {
                     setError('Unable to establish the server session. Some pages may require sign-in again.');
                 }
             }

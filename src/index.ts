@@ -1183,6 +1183,10 @@ async function resolveJwks(
     const request = (async () => {
         const response = await fetch(`${normalized}/oauth/jwks`, {
             headers: { Accept: 'application/json' },
+            redirect: 'error',
+            signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+                ? AbortSignal.timeout(10_000)
+                : undefined,
         });
         if (!response.ok) {
             throw new Error('Failed to fetch Koamishin JWKS document.');
